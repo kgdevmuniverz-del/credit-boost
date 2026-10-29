@@ -1,4 +1,5 @@
-document.querySelectorAll('form.confirm').forEach(f=>f.addEventListener('submit',e=>{if(!confirm('Delete this?'))e.preventDefault()}));
+document.querySelectorAll('form.confirm').forEach(f=>f.addEventListener('submit',e=>{const b=f.querySelector('button');if(b.dataset.armed)return;e.preventDefault();b.dataset.armed=1;b.dataset.t=b.textContent;b.textContent='Sure?';b.classList.add('arm');setTimeout(()=>{delete b.dataset.armed;b.textContent=b.dataset.t;b.classList.remove('arm')},3000)}));
+document.querySelectorAll('.toast').forEach(t=>t.addEventListener('click',()=>t.remove()));
 document.querySelectorAll('.print-btn').forEach(b=>b.addEventListener('click',()=>window.print()));
 (function(){const box=document.getElementById('util');if(!box)return;const out=document.getElementById('util-out');
 let seed=[];try{seed=JSON.parse(box.dataset.seed||'[]')}catch(e){}if(!seed.length)seed=[{n:'Card 1',b:0,l:0}];

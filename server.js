@@ -9,6 +9,7 @@ const crypto = require('crypto');
 const multer = require('multer');
 const { parse } = require('csv-parse/sync');
 const { Pool } = require('pg');
+const compression = require('compression');
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_USER = process.env.ADMIN_USERNAME || 'kai';
@@ -181,19 +182,32 @@ async function reminders() {
     out.push({ c: 'warn', at: t, t: `Settlement agreed with ${it.creditor}${it.settle_amount != null ? ' for ' + money(it.settle_amount) : ''} — pay by the agreed date and keep proof; mark it paid when done.` });
   return out.sort((a, b) => a.at - b.at);
 }
-const remindersHtml = rs => `<div class="card ${rs.length ? 'glow' : ''}"><h2>Reminders</h2>${rs.length ? '<ul class="rem">' + rs.map(r => `<li><span class="flag ${r.c}">${r.c === 'err' ? 'NOW' : 'SOON'}</span> ${esc(r.t)}</li>`).join('') + '</ul>' : '<p class="muted">Nothing due in the next 7 days.</p>'}</div>`;
+const remindersHtml = rs => `<div class="card ${rs.length ? 'glow' : ''}"><h2>${ic('bell')} Reminders</h2>${rs.length ? '<ul class="rem">' + rs.map(r => `<li><span class="flag ${r.c}">${r.c === 'err' ? 'NOW' : 'SOON'}</span> ${esc(r.t)}</li>`).join('') + '</ul>' : empty('check', 'All clear — nothing due in the next 7 days.')}</div>`;
 
 // ---------- layout ----------
+const ICONS = {
+  home: '<path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/>', list: '<path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r="1"/><circle cx="3.5" cy="12" r="1"/><circle cx="3.5" cy="18" r="1"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>', upload: '<path d="M12 16V4M6 10l6-6 6 6"/><path d="M4 20h16"/>', mail: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/>', chart: '<path d="M3 20h18"/><path d="M5 16l5-6 4 3 6-8"/>', card: '<rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/>',
+  user: '<circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6"/>', out: '<path d="M15 4h4v16h-4"/><path d="M10 8l-4 4 4 4M6 12h10"/>', alert: '<path d="M12 3l10 18H2z"/><path d="M12 10v5M12 18v.5"/>',
+  check: '<path d="M4 12l5 5L20 6"/>', bell: '<path d="M6 16V11a6 6 0 0112 0v5l2 2H4z"/><path d="M10 20a2 2 0 004 0"/>', menu: '<path d="M4 6h16M4 12h16M4 18h16"/>',
+};
+const ic = (n, c = '') => `<svg class="ic ${c}" viewBox="0 0 24 24" aria-hidden="true">${ICONS[n] || ''}</svg>`;
+const empty = (icon, text, colspan) => { const e = `<div class="empty">${ic(icon, 'big-ic')}<p>${text}</p></div>`; return colspan ? `<tr><td colspan="${colspan}">${e}</td></tr>` : e; };
+const NAV = [['/', 'home', 'Dashboard'], ['/items', 'list', 'Items'], ['/items/new', 'plus', 'Add'], ['/upload', 'upload', 'CSV'], ['/letters', 'mail', 'Letters'], ['/deadlines', 'clock', 'Deadlines'], ['/scores', 'chart', 'Scores'], ['/tips', 'card', 'Utilization'], ['/profile', 'user', 'Profile']];
 function page(req, title, body) {
-  const nav = req.session.user ? `<nav><a href="/" class="brand">CREDIT<span>//</span>BOOST</a>
-    <a href="/items">Items</a><a href="/items/new">Add</a><a href="/upload">CSV</a><a href="/letters">Letters</a>
-    <a href="/deadlines">Deadlines</a><a href="/scores">Scores</a><a href="/tips">Tips &amp; Utilization</a><a href="/profile">Profile</a>
-    <form method="post" action="/logout" class="inline">${csrf(req)}<button class="ghost">Log out</button></form></nav>` : '';
+  const cur = req.path;
+  const nav = req.session.user ? `<header class="top"><a href="/" class="brand">CREDIT<span>//</span>BOOST</a>
+    <input type="checkbox" id="navt" class="navt"><label for="navt" class="navbtn" aria-label="Menu">${ic('menu')}</label>
+    <nav>${NAV.map(([h, i, t]) => `<a href="${h}" class="${cur === h ? 'on' : ''}">${ic(i)}<span>${t}</span></a>`).join('')}
+    <form method="post" action="/logout" class="inline">${csrf(req)}<button class="ghost sm">${ic('out')}<span>Log out</span></button></form></nav></header>` : '';
+  const toasts = [USE_PG ? '' : '⚠ Storage is temporary (no DATABASE_URL set) — data is lost on restart.', req.flash || ''].filter(Boolean);
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex,nofollow"><title>${esc(title)} · Credit Boost</title><link rel="stylesheet" href="/style.css"></head>
-<body><div class="grid-bg"></div>${nav}<main>${USE_PG ? '' : '<div class="flash">⚠ Storage is temporary (no DATABASE_URL set) — data is lost on restart.</div>'}${req.flash ? `<div class="flash">${esc(req.flash)}</div>` : ''}${body}</main>
+<meta name="robots" content="noindex,nofollow"><meta name="theme-color" content="#05060f"><title>${esc(title)} · Credit Boost</title><link rel="stylesheet" href="/style.css?v=3"></head>
+<body><div class="grid-bg"></div>${nav}<main class="fade">${body}</main>
+<div class="toasts" role="status" aria-live="polite">${toasts.map(t => `<div class="toast ${/error|invalid|rejected|required|could not|ssn/i.test(t) ? 'bad' : ''}">${ic(/error|invalid|rejected|required|could not|ssn/i.test(t) ? 'alert' : 'check')}<span>${esc(t)}</span></div>`).join('')}</div>
 <footer>Private tool for Kai Green · Educational, not legal advice · Disputes can only remove information that is inaccurate, incomplete, or unverifiable.</footer>
-<script src="/app.js"></script></body></html>`;
+<script src="/app.js?v=3"></script></body></html>`;
 }
 const csrf = req => `<input type="hidden" name="_csrf" value="${esc(req.session.csrf)}">`;
 
@@ -201,6 +215,7 @@ const csrf = req => `<input type="hidden" name="_csrf" value="${esc(req.session.
 const app = express();
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
+app.use(compression());
 app.use(helmet({ contentSecurityPolicy: { directives: { 'script-src': ["'self'"], 'img-src': ["'self'", 'data:'], 'connect-src': ["'self'"] } } }));
 app.use(express.static('public', { maxAge: '1h' }));
 app.use(express.urlencoded({ extended: false, limit: '200kb' }));
@@ -295,9 +310,9 @@ app.get('/items', async (req, res) => {
    <td class="actions"><a href="/items/${i.id}/edit">Edit</a><a href="/letters?item=${i.id}">Letter</a>
    <form method="post" action="/items/${i.id}/delete" class="inline confirm">${csrf(req)}<button class="ghost sm">Delete</button></form></td></tr>`).join('');
   res.send(page(req, 'Items', `<h1 class="neon">Item Tracker</h1>
-   <p><a href="/items">All</a> · <a href="/items?f=err">Possible errors</a> · <a href="/items?f=old">Past reporting limit</a></p>
+   <p class="filters"><a href="/items">All</a><a href="/items?f=err">Possible errors</a><a href="/items?f=old">Past reporting limit</a></p>
    <div class="card scroll"><table><thead><tr><th>Bureau</th><th>Creditor</th><th>Type</th><th>Status</th><th>Opened</th><th>DOFD</th><th>Balance</th><th>Limit</th><th>Flags</th><th></th></tr></thead>
-   <tbody>${rows || '<tr><td colspan="10" class="muted">No items yet. <a href="/items/new">Add one</a> or <a href="/upload">upload a CSV</a>.</td></tr>'}</tbody></table></div>
+   <tbody>${rows || empty('list', 'No items yet. <a href="/items/new">Add one</a> or <a href="/upload">upload a CSV</a>.', 10)}</tbody></table></div>
    <p class="muted">§605 timing is estimated from the date of first delinquency (7 years; 10 for Chapter 7 bankruptcy, measured from filing). Mismatches compare items with the same creditor + last 4 across bureaus.</p>`));
 });
 
@@ -471,6 +486,35 @@ Sincerely,
 
 ${p.full_name || '[Signature]'}` };
   }
+  if (kind === 'idtheft') {
+    const b = opts.bureau || it.bureau;
+    return { to: b, subject: `Identity theft block request — ${it.creditor}`, text:
+`${me}
+
+${today}
+
+${BUREAU_ADDR[b]}
+
+RE: Request to block information resulting from identity theft — FCRA Section 605B (15 U.S.C. § 1681c-2)
+
+To Whom It May Concern:
+
+I am a victim of identity theft. The following information in my ${b} file results from that identity theft and does not relate to any transaction I made or authorized:
+
+  Creditor/Furnisher: ${it.creditor}
+  Account: ${acct}
+  Reported balance: ${money(it.balance)}
+
+${reason}
+
+Enclosed are (1) proof of my identity, (2) a copy of my identity theft report (FTC IdentityTheft.gov report and/or police report), and (3) this identification of the information to be blocked. Under Section 605B, please block this information within four business days of receiving this request and notify the furnisher that it may be the result of identity theft.
+
+Sincerely,
+
+${p.full_name || '[Signature]'}
+
+Enclosures: proof of identity; identity theft report` };
+  }
   if (kind === 'pfd') return { to: it.creditor, subject: `Settlement offer — ${it.creditor}`, text:
 `${me}
 
@@ -559,7 +603,7 @@ app.get('/letters', async (req, res) => {
   res.send(page(req, 'Letters', `<h1 class="neon">Letter Generator</h1>
   <form method="get" action="/letters/view" class="card form-grid">
    <label>Item<select name="item" required>${opts}</select></label>
-   <label>Letter type<select name="kind" id="kind"><option value="dispute">Bureau dispute (FCRA §611)</option><option value="goodwill">Goodwill (creditor)</option><option value="validation">Debt validation (FDCPA §809)</option><option value="mov">Method of verification (FCRA §611(a)(7))</option><option value="pfd">Pay-for-delete / settlement offer</option></select></label>
+   <label>Letter type<select name="kind" id="kind"><option value="dispute">Bureau dispute (FCRA §611)</option><option value="goodwill">Goodwill (creditor)</option><option value="validation">Debt validation (FDCPA §809)</option><option value="mov">Method of verification (FCRA §611(a)(7))</option><option value="pfd">Pay-for-delete / settlement offer</option><option value="idtheft">Identity theft block (FCRA §605B)</option></select></label>
    <label>Bureau (disputes)<select name="bureau"><option value="">Item's bureau</option>${BUREAUS.map(b => `<option>${b}</option>`).join('')}</select></label>
    <label>Offer amount (pay-for-delete)<input name="amount" inputmode="decimal" placeholder="e.g. 250"></label>
    <label>Original dispute date (MOV)<input type="date" name="orig"></label>
@@ -573,7 +617,7 @@ app.get('/letters/view', async (req, res) => {
   const it = (await q('SELECT * FROM items WHERE id=$1', [parseInt(req.query.item) || 0])).rows[0];
   if (!it) return res.redirect('/letters');
   const p = (await q('SELECT * FROM profile WHERE id=1')).rows[0] || {};
-  const kind = ['dispute', 'goodwill', 'validation', 'mov', 'pfd'].includes(req.query.kind) ? req.query.kind : 'dispute';
+  const kind = ['dispute', 'goodwill', 'validation', 'mov', 'pfd', 'idtheft'].includes(req.query.kind) ? req.query.kind : 'dispute';
   const bureau = BUREAUS.includes(req.query.bureau) ? req.query.bureau : null;
   const reason = clean(req.query.reason, 1500);
   const L = buildLetter(kind, it, p, { bureau, reason, amount: num(req.query.amount), orig: dt(req.query.orig) });
@@ -585,7 +629,7 @@ app.get('/letters/view', async (req, res) => {
   const qs = new URLSearchParams({ item: it.id, kind, bureau: bureau || '', reason: reason || '', amount: req.query.amount || '', orig: req.query.orig || '', download: 1 }).toString();
   res.send(page(req, L.subject, `<div class="noprint"><h1 class="neon">${esc(L.subject)}</h1>
    <p><button class="print-btn">Print / Save PDF</button> <a class="btn" href="/letters/view?${esc(qs)}">Download .txt</a>
-   <a class="btn ghost" href="/deadlines?item=${it.id}&kind=${['mov', 'pfd'].includes(kind) ? (kind === 'mov' ? 'dispute' : 'validation') : kind}&to=${encodeURIComponent(L.to)}">Log as sent →</a></p></div>
+   <a class="btn ghost" href="/deadlines?item=${it.id}&kind=${{ mov: 'dispute', idtheft: 'dispute', pfd: 'validation' }[kind] || kind}&to=${encodeURIComponent(L.to)}">Log as sent →</a></p></div>
    <article class="letter">${esc(L.text)}</article>`));
 });
 
@@ -627,7 +671,7 @@ app.get('/deadlines', async (req, res) => {
     <label class="check full"><input type="checkbox" name="after_free_report"> This dispute followed my free annual credit report (45-day window)</label>
     <button class="full">Log letter</button></form>
    <div class="card scroll"><table><thead><tr><th>Type</th><th>To</th><th>Item</th><th>Sent</th><th>Deadline / window</th><th>Status / outcome</th><th></th></tr></thead>
-   <tbody>${rows || '<tr><td colspan="7" class="muted">Nothing logged yet.</td></tr>'}</tbody></table></div>
+   <tbody>${rows || empty('clock', 'Nothing logged yet. Generate a letter, mail it, then log it here.', 7)}</tbody></table></div>
    <p class="muted">FCRA §611 gives bureaus 30 days from <i>receipt</i> (45 if the dispute follows a free annual report) — enter mail days (certified mail is typically 3–5) to count from receipt. If an item comes back "verified", you can request the method of verification (§611(a)(7); reply due within 15 days) and/or file a complaint with the CFPB. A validation request under FDCPA §809(b) is strongest within 30 days of the collector's first notice. Goodwill letters carry no legal deadline.</p>`));
 });
 app.post('/deadlines', async (req, res) => {
@@ -653,7 +697,7 @@ app.post('/deadlines/:id/delete', async (req, res) => { await q('DELETE FROM dis
 // Scores
 const SCORE_COL = { Equifax: '#ff2bd6', Experian: '#00f0ff', TransUnion: '#3dffa8' };
 function scoreChart(rows) {
-  if (!rows.length) return '<p class="muted">Log a score to start the chart.</p>';
+  if (!rows.length) return empty('chart', 'Log a score to start the chart.');
   const W = 760, H = 300, P = 44;
   const ts = rows.map(r => new Date(r.score_date).getTime());
   let t0 = Math.min(...ts), t1 = Math.max(...ts); if (t0 === t1) { t0 -= 15 * 864e5; t1 += 15 * 864e5; }
@@ -689,7 +733,7 @@ app.get('/scores', async (req, res) => {
     <label>Model / source<input name="model" maxlength="60" placeholder="FICO 8, VantageScore 3.0..."></label>
     <button class="full">Log score</button></form>
    <div class="card scroll"><table><thead><tr><th>Date</th><th>Bureau</th><th>Score</th><th>Model</th><th></th></tr></thead><tbody>
-   ${rows.slice().reverse().map(r => `<tr><td>${fmtD(r.score_date)}</td><td>${esc(r.bureau)}</td><td><b>${r.score}</b></td><td>${esc(r.model || '')}</td><td><form method="post" action="/scores/${r.id}/delete" class="inline confirm">${csrf(req)}<button class="ghost sm">✕</button></form></td></tr>`).join('') || '<tr><td colspan="5" class="muted">No scores yet.</td></tr>'}
+   ${rows.slice().reverse().map(r => `<tr><td>${fmtD(r.score_date)}</td><td>${esc(r.bureau)}</td><td><b>${r.score}</b></td><td>${esc(r.model || '')}</td><td><form method="post" action="/scores/${r.id}/delete" class="inline confirm">${csrf(req)}<button class="ghost sm">✕</button></form></td></tr>`).join('') || empty('chart', 'No scores yet. Log your first one above.', 5)}
    </tbody></table></div><p class="muted">Different models (FICO vs VantageScore) and sources give different numbers — compare like with like.</p>`));
 });
 app.post('/scores', async (req, res) => {
