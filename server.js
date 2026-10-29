@@ -127,6 +127,7 @@ function nextDay(day, from = todayUTC()) { // next occurrence (today included) o
     if (d >= from) return d;
   }
 }
+const KINDS = [['dispute', 'Bureau dispute (§611)'], ['idtheft', 'Identity-theft block (§605B)'], ['validation', 'Debt validation (§809)'], ['settlement', 'Settlement / pay-for-delete'], ['goodwill', 'Goodwill']];
 const OUTCOMES = ['open', 'deleted', 'updated', 'verified', 'no response'];
 // Timing for one logged letter. Disputes: 30 days (45 after free annual report) from receipt = sent + mail days.
 function timing(d) {
@@ -135,6 +136,12 @@ function timing(d) {
     const recv = addDays(sent, d.mail_days || 0), days = d.after_free_report ? 45 : 30, due = addDays(recv, days);
     return { due, days, recv, left: daysBetween(t, due) };
   }
+  if (d.kind === 'idtheft') { // FCRA §605B: block within 4 business days of receipt
+    const recv = addDays(sent, d.mail_days || 0); let due = recv, n = 0;
+    while (n < 4) { due = addDays(due, 1); if (due.getUTCDay() % 6) n++; }
+    return { due, days: 4, recv, left: daysBetween(t, due) };
+  }
+  if (d.kind === 'settlement') { const f = addDays(sent, 30); return { followUp: f, fleft: daysBetween(t, f) }; }
   if (d.kind === 'validation' && d.first_notice) {
     const end = addDays(new Date(d.first_notice), 30);
     return { windowEnd: end, inWindow: sent <= end };
@@ -159,14 +166,17 @@ async function reminders() {
   for (const d of ds) {
     const x = timing(d);
     if (d.status === 'open' && x.due) {
-      if (x.left < 0) out.push({ c: 'err', at: x.due, t: `Dispute to ${d.recipient} (${d.creditor || '—'}) is ${-x.left}d past its ${x.days}-day deadline — record the outcome, or send a follow-up / CFPB complaint.` });
+      if (d.kind === 'idtheft') { out.push({ c: x.left < 0 ? 'err' : 'warn', at: x.due, t: x.left < 0 ? `§605B identity-theft block by ${d.recipient} (${d.creditor || '—'}) is ${-x.left}d past its 4-business-day deadline — check your report; if not blocked, follow up and file a CFPB complaint.` : `§605B identity-theft block by ${d.recipient} (${d.creditor || '—'}) due ${x.left ? `in ${x.left}d` : 'today'} (${fmtD(x.due)}, 4 business days from receipt).` }); }
+      else if (x.left < 0) out.push({ c: 'err', at: x.due, t: `Dispute to ${d.recipient} (${d.creditor || '—'}) is ${-x.left}d past its ${x.days}-day deadline — record the outcome, or send a follow-up / CFPB complaint.` });
       else if (x.left <= 7) out.push({ c: 'warn', at: x.due, t: `Dispute to ${d.recipient} (${d.creditor || '—'}) due in ${x.left}d (${fmtD(x.due)}).` });
     }
+    if (d.kind === 'settlement' && d.status === 'open' && x.fleft <= 3)
+      out.push({ c: x.fleft < 0 ? 'err' : 'warn', at: x.followUp, t: `Settlement / pay-for-delete offer to ${d.recipient} (${d.creditor || '—'}): ${x.fleft < 0 ? `no outcome ${-x.fleft}d after the 30-day follow-up date` : `follow up ${x.fleft ? `in ${x.fleft}d` : 'today'}`} — call or write; never pay without a signed written agreement.` });
     if (d.kind === 'validation' && x.windowEnd && !x.inWindow && d.status === 'open')
       out.push({ c: 'warn', at: x.windowEnd, t: `Validation request to ${d.recipient} was sent after the 30-day window (ended ${fmtD(x.windowEnd)}); §809(b) cease-collection protection may not apply.` });
     if (d.mov_sent && !['deleted', 'updated'].includes(d.status)) {
       const due = addDays(new Date(d.mov_sent), 15), left = daysBetween(t, due);
-      if (left <= 7) out.push({ c: left < 0 ? 'err' : 'warn', at: due, t: `Method-of-verification reply from ${d.recipient} ${left < 0 ? `is ${-left}d late` : `due in ${left}d`} (15 days from request, FCRA §611(a)(7)).` });
+      out.push({ c: left < 0 ? 'err' : left <= 3 ? 'warn' : 'ok', at: due, t: `Method-of-verification reply from ${d.recipient} ${left < 0 ? `is ${-left}d late` : `due in ${left}d`} (15 days from request, FCRA §611(a)(7)).` });
     }
   }
   const items = (await q('SELECT * FROM items')).rows;
@@ -182,7 +192,7 @@ async function reminders() {
     out.push({ c: 'warn', at: t, t: `Settlement agreed with ${it.creditor}${it.settle_amount != null ? ' for ' + money(it.settle_amount) : ''} — pay by the agreed date and keep proof; mark it paid when done.` });
   return out.sort((a, b) => a.at - b.at);
 }
-const remindersHtml = rs => `<div class="card ${rs.length ? 'glow' : ''}"><h2>${ic('bell')} Reminders</h2>${rs.length ? '<ul class="rem">' + rs.map(r => `<li><span class="flag ${r.c}">${r.c === 'err' ? 'NOW' : 'SOON'}</span> ${esc(r.t)}</li>`).join('') + '</ul>' : empty('check', 'All clear — nothing due in the next 7 days.')}</div>`;
+const remindersHtml = rs => `<div class="card ${rs.length ? 'glow' : ''}"><h2>${ic('bell')} Reminders</h2>${rs.length ? '<ul class="rem">' + rs.map(r => `<li><span class="flag ${r.c}">${r.c === 'err' ? 'NOW' : r.c === 'ok' ? 'TRACK' : 'SOON'}</span> ${esc(r.t)}</li>`).join('') + '</ul>' : empty('check', 'All clear — nothing due in the next 7 days.')}</div>`;
 
 // ---------- layout ----------
 const ICONS = {
@@ -269,7 +279,7 @@ app.use(auth);
 // Dashboard
 app.get('/', async (req, res) => {
   const items = analyze((await q('SELECT * FROM items ORDER BY creditor')).rows);
-  const ds = (await q("SELECT * FROM disputes WHERE status='open' AND kind <> 'goodwill'")).rows;
+  const ds = (await q("SELECT * FROM disputes WHERE status='open' AND kind NOT IN ('goodwill', 'settlement')")).rows;
   const today = new Date();
   const overdue = ds.filter(d => (timing(d).left ?? 0) < 0).length;
   const rems = await reminders();
@@ -629,7 +639,7 @@ app.get('/letters/view', async (req, res) => {
   const qs = new URLSearchParams({ item: it.id, kind, bureau: bureau || '', reason: reason || '', amount: req.query.amount || '', orig: req.query.orig || '', download: 1 }).toString();
   res.send(page(req, L.subject, `<div class="noprint"><h1 class="neon">${esc(L.subject)}</h1>
    <p><button class="print-btn">Print / Save PDF</button> <a class="btn" href="/letters/view?${esc(qs)}">Download .txt</a>
-   <a class="btn ghost" href="/deadlines?item=${it.id}&kind=${{ mov: 'dispute', idtheft: 'dispute', pfd: 'validation' }[kind] || kind}&to=${encodeURIComponent(L.to)}">Log as sent →</a></p></div>
+   <a class="btn ghost" href="/deadlines?item=${it.id}&kind=${{ mov: 'dispute', pfd: 'settlement' }[kind] || kind}&to=${encodeURIComponent(L.to)}">Log as sent →</a></p></div>
    <article class="letter">${esc(L.text)}</article>`));
 });
 
@@ -643,12 +653,18 @@ app.get('/deadlines', async (req, res) => {
     if (d.kind === 'dispute') {
       due = `<b>${fmtD(x.due)}</b> <span class="muted">(${x.days}d from ${d.mail_days ? 'receipt ' + fmtD(x.recv) : 'sent'})</span>`;
       st = !open ? esc(d.status) : x.left < 0 ? `<span class="flag err">OVERDUE ${-x.left}d</span>` : `<span class="flag ${x.left <= 5 ? 'warn' : 'ok'}">${x.left}d left</span>`;
+    } else if (d.kind === 'idtheft') {
+      due = `<b>${fmtD(x.due)}</b> <span class="muted">(block within 4 business days of ${d.mail_days ? 'receipt ' + fmtD(x.recv) : 'sent'}, FCRA §605B)</span>`;
+      st = !open ? esc(d.status) : x.left < 0 ? `<span class="flag err">OVERDUE ${-x.left}d</span>` : `<span class="flag warn">${x.left}d left</span>`;
+    } else if (d.kind === 'settlement') {
+      due = `<span class="muted">No legal deadline · follow up by</span> <b>${fmtD(x.followUp)}</b>`;
+      st = !open ? esc(d.status) : x.fleft < 0 ? `<span class="flag warn">follow up now</span>` : '<span class="flag ok">awaiting written reply</span>';
     } else if (d.kind === 'validation') {
       due = d.first_notice ? `<span class="muted">1st notice ${fmtD(d.first_notice)} → 30-day window ends</span> <b>${fmtD(x.windowEnd)}</b> ${x.inWindow ? '<span class="flag ok">sent in window</span>' : '<span class="flag err">sent after window</span>'}` : '<span class="muted">Log first-notice date to check the 30-day window</span>';
       st = open ? '<span class="flag ok">awaiting verification</span>' : esc(d.status);
     } else st = open ? '<span class="flag ok">awaiting reply</span>' : esc(d.status);
     let follow = '';
-    if (d.kind === 'dispute' && d.item_id && (d.status === 'verified' || d.status === 'no response' || (open && x.left < 0))) {
+    if (['dispute', 'idtheft'].includes(d.kind) && d.item_id && (d.status === 'verified' || d.status === 'no response' || (open && x.left < 0))) {
       const bq = BUREAUS.includes(d.recipient) ? '&bureau=' + d.recipient : '';
       follow = `<div class="follow">${d.status === 'verified' ? `<a href="/letters/view?item=${d.item_id}&kind=mov${bq}&orig=${fmtD(d.date_sent)}">MOV letter</a>` : ''}
         ${d.mov_sent ? `<span class="muted">MOV sent ${fmtD(d.mov_sent)} (reply due ${fmtD(addDays(new Date(d.mov_sent), 15))})</span>` : d.status === 'verified' ? `<form method="post" action="/deadlines/${d.id}/mov" class="inline">${csrf(req)}<button class="ghost sm">Mark MOV sent today</button></form>` : ''}
@@ -663,24 +679,24 @@ app.get('/deadlines', async (req, res) => {
   res.send(page(req, 'Deadlines', `<h1 class="neon">Deadline &amp; Outcome Tracker</h1>
    <form method="post" action="/deadlines" class="card form-grid">${csrf(req)}
     <label>Item<select name="item_id"><option value="">(none)</option>${items.map(i => `<option value="${i.id}" ${i.id === sel ? 'selected' : ''}>${esc(i.creditor)} (${esc(i.bureau)})</option>`).join('')}</select></label>
-    <label>Type<select name="kind">${['dispute', 'goodwill', 'validation'].map(k => `<option ${k === req.query.kind ? 'selected' : ''}>${k}</option>`).join('')}</select></label>
+    <label>Type<select name="kind">${KINDS.map(([k, l]) => `<option value="${k}" ${k === req.query.kind ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
     <label>Sent to<input name="recipient" required maxlength="120" value="${esc(req.query.to || '')}"></label>
     <label>Date sent<input type="date" name="date_sent" required value="${new Date().toISOString().slice(0, 10)}"></label>
-    <label>Mail days until received (disputes; 0 = count from sent)<input type="number" name="mail_days" min="0" max="30" value="0"></label>
+    <label>Mail days until received (disputes / §605B; 0 = count from sent)<input type="number" name="mail_days" min="0" max="30" value="0"></label>
     <label>Collector's first notice date (validation)<input type="date" name="first_notice"></label>
     <label class="check full"><input type="checkbox" name="after_free_report"> This dispute followed my free annual credit report (45-day window)</label>
     <button class="full">Log letter</button></form>
    <div class="card scroll"><table><thead><tr><th>Type</th><th>To</th><th>Item</th><th>Sent</th><th>Deadline / window</th><th>Status / outcome</th><th></th></tr></thead>
    <tbody>${rows || empty('clock', 'Nothing logged yet. Generate a letter, mail it, then log it here.', 7)}</tbody></table></div>
-   <p class="muted">FCRA §611 gives bureaus 30 days from <i>receipt</i> (45 if the dispute follows a free annual report) — enter mail days (certified mail is typically 3–5) to count from receipt. If an item comes back "verified", you can request the method of verification (§611(a)(7); reply due within 15 days) and/or file a complaint with the CFPB. A validation request under FDCPA §809(b) is strongest within 30 days of the collector's first notice. Goodwill letters carry no legal deadline.</p>`));
+   <p class="muted">FCRA §611 gives bureaus 30 days from <i>receipt</i> (45 if the dispute follows a free annual report) — enter mail days (certified mail is typically 3–5) to count from receipt. If an item comes back "verified", you can request the method of verification (§611(a)(7); reply due within 15 days) and/or file a complaint with the CFPB. A validation request under FDCPA §809(b) is strongest within 30 days of the collector's first notice. A §605B identity-theft block (with an identity theft report) must be made within 4 business days of receipt. Goodwill and settlement / pay-for-delete letters carry no legal deadline — the tracker reminds you to follow up after 30 days, and you should never pay a settlement without a signed written agreement.</p>`));
 });
 app.post('/deadlines', async (req, res) => {
   const b = req.body; const d = dt(b.date_sent);
   if (!d || !clean(b.recipient)) { flash(req, 'Recipient and date are required.'); return res.redirect('/deadlines'); }
-  const kind = ['dispute', 'goodwill', 'validation'].includes(b.kind) ? b.kind : 'dispute';
+  const kind = KINDS.some(([k]) => k === b.kind) ? b.kind : 'dispute';
   const md = Math.min(30, Math.max(0, parseInt(b.mail_days) || 0));
   await q('INSERT INTO disputes (item_id, kind, recipient, date_sent, after_free_report, mail_days, first_notice) VALUES ($1,$2,$3,$4,$5,$6,$7)',
-    [parseInt(b.item_id) || null, kind, clean(b.recipient, 120), d, b.after_free_report === 'on' && kind === 'dispute', kind === 'dispute' ? md : 0, kind === 'validation' ? dt(b.first_notice) : null]);
+    [parseInt(b.item_id) || null, kind, clean(b.recipient, 120), d, b.after_free_report === 'on' && kind === 'dispute', ['dispute', 'idtheft'].includes(kind) ? md : 0, kind === 'validation' ? dt(b.first_notice) : null]);
   flash(req, 'Logged.'); res.redirect('/deadlines');
 });
 app.post('/deadlines/:id/mov', async (req, res) => {
