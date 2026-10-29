@@ -12,15 +12,22 @@ const { Pool } = require('pg');
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_USER = process.env.ADMIN_USERNAME || 'kai';
-if (!process.env.ADMIN_PASSWORD || !process.env.SESSION_SECRET || !process.env.DATABASE_URL) {
-  console.error('Missing ADMIN_PASSWORD, SESSION_SECRET or DATABASE_URL'); process.exit(1);
+if (!process.env.ADMIN_PASSWORD || !process.env.SESSION_SECRET) {
+  console.error('Missing ADMIN_PASSWORD or SESSION_SECRET'); process.exit(1);
 }
+const USE_PG = !!process.env.DATABASE_URL;
 // Hash the password once at boot; the plaintext is never stored or logged.
 const ADMIN_HASH = bcrypt.hashSync(process.env.ADMIN_PASSWORD, 12);
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL,
+// Postgres when DATABASE_URL is set; otherwise an in-process, NON-persistent PGlite fallback.
+let pool = null, lite = null;
+if (USE_PG) pool = new Pool({ connectionString: process.env.DATABASE_URL,
   ssl: /render\.com/.test(process.env.DATABASE_URL) ? { rejectUnauthorized: false } : false });
-const q = (t, p) => pool.query(t, p);
+const q = async (t, p) => {
+  if (pool) return pool.query(t, p);
+  if (!lite) { const { PGlite } = await import('@electric-sql/pglite'); lite = new PGlite(); }
+  return lite.query(t, p || []);
+};
 
 async function migrate() {
   await q(`CREATE TABLE IF NOT EXISTS items (
@@ -101,7 +108,7 @@ function page(req, title, body) {
     <form method="post" action="/logout" class="inline">${csrf(req)}<button class="ghost">Log out</button></form></nav>` : '';
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex,nofollow"><title>${esc(title)} · Credit Boost</title><link rel="stylesheet" href="/style.css"></head>
-<body><div class="grid-bg"></div>${nav}<main>${req.flash ? `<div class="flash">${esc(req.flash)}</div>` : ''}${body}</main>
+<body><div class="grid-bg"></div>${nav}<main>${USE_PG ? '' : '<div class="flash">⚠ Storage is temporary (no DATABASE_URL set) — data is lost on restart.</div>'}${req.flash ? `<div class="flash">${esc(req.flash)}</div>` : ''}${body}</main>
 <footer>Private tool for Kai Green · Educational, not legal advice · Disputes can only remove information that is inaccurate, incomplete, or unverifiable.</footer>
 <script src="/app.js"></script></body></html>`;
 }
@@ -115,7 +122,7 @@ app.use(helmet({ contentSecurityPolicy: { directives: { 'script-src': ["'self'"]
 app.use(express.static('public', { maxAge: '1h' }));
 app.use(express.urlencoded({ extended: false, limit: '200kb' }));
 app.use(session({
-  store: new PgStore({ pool, createTableIfMissing: true }),
+  store: USE_PG ? new PgStore({ pool, createTableIfMissing: true }) : undefined,
   name: 'cb.sid', secret: process.env.SESSION_SECRET, resave: false, saveUninitialized: false,
   cookie: { httpOnly: true, sameSite: 'strict', secure: process.env.NODE_ENV === 'production', maxAge: 8 * 3600 * 1000 },
 }));
