@@ -166,7 +166,7 @@ async function reminders() {
   for (const d of ds) {
     const x = timing(d);
     if (d.status === 'open' && x.due) {
-      if (d.kind === 'idtheft') { out.push({ c: x.left < 0 ? 'err' : 'warn', at: x.due, t: x.left < 0 ? `§605B identity-theft block by ${d.recipient} (${d.creditor || '—'}) is ${-x.left}d past its 4-business-day deadline — check your report; if not blocked, follow up and file a CFPB complaint.` : `§605B identity-theft block by ${d.recipient} (${d.creditor || '—'}) due ${x.left ? `in ${x.left}d` : 'today'} (${fmtD(x.due)}, 4 business days from receipt).` }); }
+      if (d.kind === 'idtheft') { out.push({ c: x.left < 0 ? 'err' : 'warn', at: x.due, t: x.left < 0 ? `§605B identity-theft block by ${d.recipient} (${d.creditor || '—'}) is ${-x.left}d past its 4-business-day deadline — check your report; if not blocked, follow up and file a CFPB complaint.` : `§605B identity-theft block by ${d.recipient} (${d.creditor || '—'}) due ${x.left ? `in ${x.left}d` : 'today'} (${fmtD(x.due)}, 4 business days from ${d.mail_days ? 'receipt' : 'date sent'}).` }); }
       else if (x.left < 0) out.push({ c: 'err', at: x.due, t: `Dispute to ${d.recipient} (${d.creditor || '—'}) is ${-x.left}d past its ${x.days}-day deadline — record the outcome, or send a follow-up / CFPB complaint.` });
       else if (x.left <= 7) out.push({ c: 'warn', at: x.due, t: `Dispute to ${d.recipient} (${d.creditor || '—'}) due in ${x.left}d (${fmtD(x.due)}).` });
     }
