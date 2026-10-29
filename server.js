@@ -203,11 +203,11 @@ function page(req, title, body) {
     <form method="post" action="/logout" class="inline">${csrf(req)}<button class="ghost sm">${ic('out')}<span>Log out</span></button></form></nav></header>` : '';
   const toasts = [USE_PG ? '' : '⚠ Storage is temporary (no DATABASE_URL set) — data is lost on restart.', req.flash || ''].filter(Boolean);
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex,nofollow"><meta name="theme-color" content="#05060f"><title>${esc(title)} · Credit Boost</title><link rel="stylesheet" href="/style.css?v=3"></head>
+<meta name="robots" content="noindex,nofollow"><meta name="theme-color" content="#05060f"><title>${esc(title)} · Credit Boost</title><link rel="stylesheet" href="/style.css?v=4"></head>
 <body><div class="grid-bg"></div>${nav}<main class="fade">${body}</main>
 <div class="toasts" role="status" aria-live="polite">${toasts.map(t => `<div class="toast ${/error|invalid|rejected|required|could not|ssn/i.test(t) ? 'bad' : ''}">${ic(/error|invalid|rejected|required|could not|ssn/i.test(t) ? 'alert' : 'check')}<span>${esc(t)}</span></div>`).join('')}</div>
 <footer>Private tool for Kai Green · Educational, not legal advice · Disputes can only remove information that is inaccurate, incomplete, or unverifiable.</footer>
-<script src="/app.js?v=3"></script></body></html>`;
+<script src="/app.js?v=4"></script></body></html>`;
 }
 const csrf = req => `<input type="hidden" name="_csrf" value="${esc(req.session.csrf)}">`;
 
