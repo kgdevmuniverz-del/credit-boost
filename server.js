@@ -35,6 +35,12 @@ async function migrate() {
     id SERIAL PRIMARY KEY, item_id INT REFERENCES items(id) ON DELETE SET NULL, kind TEXT NOT NULL,
     recipient TEXT NOT NULL, date_sent DATE NOT NULL, after_free_report BOOLEAN DEFAULT FALSE,
     status TEXT DEFAULT 'open', response_date DATE, notes TEXT, created_at TIMESTAMPTZ DEFAULT now())`);
+  for (const c of ['due_day INT', 'close_day INT', 'settle_status TEXT', 'settle_amount NUMERIC(12,2)', 'settle_notes TEXT'])
+    await q(`ALTER TABLE items ADD COLUMN IF NOT EXISTS ${c}`);
+  for (const c of ['mail_days INT DEFAULT 0', 'first_notice DATE', 'outcome_date DATE', 'mov_sent DATE'])
+    await q(`ALTER TABLE disputes ADD COLUMN IF NOT EXISTS ${c}`);
+  await q(`CREATE TABLE IF NOT EXISTS scores (id SERIAL PRIMARY KEY, bureau TEXT NOT NULL, score INT NOT NULL,
+    model TEXT, score_date DATE NOT NULL, created_at TIMESTAMPTZ DEFAULT now())`);
   await q(`CREATE TABLE IF NOT EXISTS profile (id INT PRIMARY KEY DEFAULT 1, full_name TEXT, address TEXT, CHECK (id=1))`);
   await q(`INSERT INTO profile (id) VALUES (1) ON CONFLICT DO NOTHING`);
 }
@@ -104,16 +110,84 @@ function analyze(items) {
       if (limit <= today) f.push({ c: 'old', t: `Past ${yrs}-yr FCRA §605 reporting period (since ${fmtD(limit)}) — likely obsolete` });
       else if (addDays(limit, -180) <= today) f.push({ c: 'warn', t: `Ages off ~${fmtD(limit)} (FCRA §605)` });
     }
+    if (it.settle_status) f.push({ c: 'ok', t: 'Payoff: ' + it.settle_status + (it.settle_amount != null ? ' (' + money(it.settle_amount) + ')' : '') });
     it.flags = f;
   }
   return items;
 }
 
+const todayUTC = () => new Date(new Date().toISOString().slice(0, 10));
+const daysBetween = (a, b) => Math.round((b - a) / 86400000);
+function nextDay(day, from = todayUTC()) { // next occurrence (today included) of a day-of-month, clamped to month length
+  for (let m = 0; m < 3; m++) {
+    const y = from.getUTCFullYear(), mo = from.getUTCMonth() + m;
+    const last = new Date(Date.UTC(y, mo + 1, 0)).getUTCDate();
+    const d = new Date(Date.UTC(y, mo, Math.min(day, last)));
+    if (d >= from) return d;
+  }
+}
+const OUTCOMES = ['open', 'deleted', 'updated', 'verified', 'no response'];
+// Timing for one logged letter. Disputes: 30 days (45 after free annual report) from receipt = sent + mail days.
+function timing(d) {
+  const t = todayUTC(), sent = new Date(d.date_sent);
+  if (d.kind === 'dispute') {
+    const recv = addDays(sent, d.mail_days || 0), days = d.after_free_report ? 45 : 30, due = addDays(recv, days);
+    return { due, days, recv, left: daysBetween(t, due) };
+  }
+  if (d.kind === 'validation' && d.first_notice) {
+    const end = addDays(new Date(d.first_notice), 30);
+    return { windowEnd: end, inWindow: sent <= end };
+  }
+  return {};
+}
+function payoffPlan(cards, budget) {
+  const list = dedupeCards(cards).filter(c => Number(c.credit_limit) > 0).map(c => {
+    const b = Number(c.balance || 0), l = Number(c.credit_limit);
+    return { name: c.creditor + (c.acct_last4 ? ' ••' + c.acct_last4 : ''), b, l, u: b / l * 100, to30: Math.max(0, b - l * 0.3), to10: Math.max(0, b - l * 0.1), pay: 0 };
+  }).sort((a, b) => b.u - a.u);
+  let left = budget > 0 ? budget : 0;
+  for (const tier of ['to30', 'to10']) for (const c of list) { // highest utilization first, first get all cards under 30%, then 10%
+    const need = Math.max(0, c[tier] - c.pay); const x = Math.min(need, left); c.pay += x; left -= x;
+  }
+  const B = list.reduce((s, c) => s + c.b, 0), L = list.reduce((s, c) => s + c.l, 0), P = list.reduce((s, c) => s + c.pay, 0);
+  return { list, B, L, P, util: L ? B / L * 100 : null, after: L ? (B - P) / L * 100 : null, leftover: left };
+}
+async function reminders() {
+  const out = [], t = todayUTC();
+  const ds = (await q("SELECT d.*, i.creditor FROM disputes d LEFT JOIN items i ON i.id=d.item_id WHERE d.status='open' OR d.mov_sent IS NOT NULL")).rows;
+  for (const d of ds) {
+    const x = timing(d);
+    if (d.status === 'open' && x.due) {
+      if (x.left < 0) out.push({ c: 'err', at: x.due, t: `Dispute to ${d.recipient} (${d.creditor || '—'}) is ${-x.left}d past its ${x.days}-day deadline — record the outcome, or send a follow-up / CFPB complaint.` });
+      else if (x.left <= 7) out.push({ c: 'warn', at: x.due, t: `Dispute to ${d.recipient} (${d.creditor || '—'}) due in ${x.left}d (${fmtD(x.due)}).` });
+    }
+    if (d.kind === 'validation' && x.windowEnd && !x.inWindow && d.status === 'open')
+      out.push({ c: 'warn', at: x.windowEnd, t: `Validation request to ${d.recipient} was sent after the 30-day window (ended ${fmtD(x.windowEnd)}); §809(b) cease-collection protection may not apply.` });
+    if (d.mov_sent && !['deleted', 'updated'].includes(d.status)) {
+      const due = addDays(new Date(d.mov_sent), 15), left = daysBetween(t, due);
+      if (left <= 7) out.push({ c: left < 0 ? 'err' : 'warn', at: due, t: `Method-of-verification reply from ${d.recipient} ${left < 0 ? `is ${-left}d late` : `due in ${left}d`} (15 days from request, FCRA §611(a)(7)).` });
+    }
+  }
+  const items = (await q('SELECT * FROM items')).rows;
+  for (const it of dedupeCards(items.filter(i => i.due_day || i.close_day)).map(c => c)) {
+    const name = it.creditor + (it.acct_last4 ? ' ••' + it.acct_last4 : '');
+    if (it.due_day) { const d = nextDay(it.due_day), left = daysBetween(t, d); if (left <= 7) out.push({ c: left <= 2 ? 'err' : 'warn', at: d, t: `Payment due on ${name} ${left ? `in ${left}d` : 'TODAY'} (${fmtD(d)}).` }); }
+    if (it.close_day && Number(it.credit_limit) > 0) {
+      const d = nextDay(it.close_day), left = daysBetween(t, d), u = Number(it.balance || 0) / Number(it.credit_limit) * 100;
+      if (left <= 5 && u >= 30) out.push({ c: 'warn', at: d, t: `Statement for ${name} closes in ${left}d at ${u.toFixed(0)}% utilization — pay ${money(Number(it.balance) - Number(it.credit_limit) * 0.29)} before then to report under 30%.` });
+    }
+  }
+  for (const it of items.filter(i => i.settle_status === 'settlement agreed (in writing)'))
+    out.push({ c: 'warn', at: t, t: `Settlement agreed with ${it.creditor}${it.settle_amount != null ? ' for ' + money(it.settle_amount) : ''} — pay by the agreed date and keep proof; mark it paid when done.` });
+  return out.sort((a, b) => a.at - b.at);
+}
+const remindersHtml = rs => `<div class="card ${rs.length ? 'glow' : ''}"><h2>Reminders</h2>${rs.length ? '<ul class="rem">' + rs.map(r => `<li><span class="flag ${r.c}">${r.c === 'err' ? 'NOW' : 'SOON'}</span> ${esc(r.t)}</li>`).join('') + '</ul>' : '<p class="muted">Nothing due in the next 7 days.</p>'}</div>`;
+
 // ---------- layout ----------
 function page(req, title, body) {
   const nav = req.session.user ? `<nav><a href="/" class="brand">CREDIT<span>//</span>BOOST</a>
     <a href="/items">Items</a><a href="/items/new">Add</a><a href="/upload">CSV</a><a href="/letters">Letters</a>
-    <a href="/deadlines">Deadlines</a><a href="/tips">Tips &amp; Utilization</a><a href="/profile">Profile</a>
+    <a href="/deadlines">Deadlines</a><a href="/scores">Scores</a><a href="/tips">Tips &amp; Utilization</a><a href="/profile">Profile</a>
     <form method="post" action="/logout" class="inline">${csrf(req)}<button class="ghost">Log out</button></form></nav>` : '';
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex,nofollow"><title>${esc(title)} · Credit Boost</title><link rel="stylesheet" href="/style.css"></head>
@@ -130,6 +204,7 @@ app.disable('x-powered-by');
 app.use(helmet({ contentSecurityPolicy: { directives: { 'script-src': ["'self'"], 'img-src': ["'self'", 'data:'], 'connect-src': ["'self'"] } } }));
 app.use(express.static('public', { maxAge: '1h' }));
 app.use(express.urlencoded({ extended: false, limit: '200kb' }));
+app.get('/healthz', (req, res) => { res.set('Cache-Control', 'no-store'); res.type('text').send('ok'); });
 app.use(session({
   store: USE_PG ? new PgStore({ pool, createTableIfMissing: true }) : undefined,
   name: 'cb.sid', secret: process.env.SESSION_SECRET, resave: false, saveUninitialized: false,
@@ -151,7 +226,6 @@ app.post('*', (req, res, next) => (req.is('multipart/form-data') ? next() : chec
 const auth = (req, res, next) => (req.session.user ? next() : res.redirect('/login'));
 const flash = (req, m) => { req.session.flash = m; };
 
-app.get('/healthz', (req, res) => res.send('ok'));
 
 const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 5, standardHeaders: true, legacyHeaders: false,
   skipSuccessfulRequests: true, handler: (req, res) => res.status(429).send(page(req, 'Locked', '<div class="card"><h1>Too many attempts</h1><p>Try again in 15 minutes.</p></div>')) });
@@ -182,7 +256,9 @@ app.get('/', async (req, res) => {
   const items = analyze((await q('SELECT * FROM items ORDER BY creditor')).rows);
   const ds = (await q("SELECT * FROM disputes WHERE status='open' AND kind <> 'goodwill'")).rows;
   const today = new Date();
-  const overdue = ds.filter(d => addDays(d.date_sent, d.after_free_report ? 45 : 30) < today).length;
+  const overdue = ds.filter(d => (timing(d).left ?? 0) < 0).length;
+  const rems = await reminders();
+  const sc = (await q('SELECT DISTINCT ON (bureau) bureau, score FROM scores ORDER BY bureau, score_date DESC, id DESC')).rows;
   const flagged = items.filter(i => i.flags.some(f => f.c === 'err')).length;
   const old = items.filter(i => i.flags.some(f => f.c === 'old')).length;
   const cards = dedupeCards(items.filter(i => /credit card/i.test(i.type || '') && Number(i.credit_limit) > 0));
@@ -195,7 +271,9 @@ app.get('/', async (req, res) => {
    <a class="stat" href="/items?f=old"><b>${old}</b><span>Past §605 limit</span></a>
    <a class="stat ${overdue ? 'mag' : ''}" href="/deadlines"><b>${ds.length}</b><span>Open disputes · ${overdue} overdue</span></a>
    <a class="stat" href="/tips"><b>${util == null ? '—' : util.toFixed(1) + '%'}</b><span>Card utilization</span></a>
+   <a class="stat" href="/scores"><b>${sc.length ? sc.map(x => x.score).join(' / ') : '—'}</b><span>Latest scores${sc.length ? ' (' + sc.map(x => x.bureau[0] + x.bureau[1]).join('/') + ')' : ''}</span></a>
   </div>
+  ${remindersHtml(rems)}
   <div class="card"><h2>Next moves</h2><ol>
    <li>Pull free reports at <b>AnnualCreditReport.com</b> (the only federally authorized free source).</li>
    <li>Enter items or upload a CSV; mark anything you believe is inaccurate.</li>
@@ -238,22 +316,33 @@ function itemForm(req, it = {}, action) {
    <label class="full">Notes<textarea name="notes" maxlength="2000">${esc(it.notes)}</textarea></label>
    <label class="check full"><input type="checkbox" name="inaccurate" ${it.inaccurate ? 'checked' : ''}> I believe this item is inaccurate</label>
    <label class="full">What is inaccurate?<input name="inaccuracy_reason" maxlength="300" value="${esc(it.inaccuracy_reason)}" placeholder="e.g. Not my account; balance wrong; paid but shows open"></label>
+   <label>Payment due (day of month)<input type="number" name="due_day" min="1" max="31" value="${it.due_day ?? ''}"></label>
+   <label>Statement closes (day of month)<input type="number" name="close_day" min="1" max="31" value="${it.close_day ?? ''}"></label>
+   <label>Settlement / payoff status<select name="settle_status">${SETTLE.map(x => `<option value="${esc(x)}" ${x === (it.settle_status || '') ? 'selected' : ''}>${esc(x || '(none)')}</option>`).join('')}</select></label>
+   <label>Agreed / offered amount<input name="settle_amount" inputmode="decimal" value="${it.settle_amount ?? ''}"></label>
+   <label class="full">Settlement notes (who, date, reference — get agreements in writing before paying)<input name="settle_notes" maxlength="500" value="${esc(it.settle_notes)}"></label>
    <p class="muted full">Never enter a Social Security number. Anything SSN-shaped is rejected.</p>
    <button class="full">Save item</button></form>`;
 }
+const ITEM_COLS = ['bureau', 'creditor', 'acct_last4', 'type', 'status', 'date_opened', 'dofd', 'balance', 'credit_limit', 'notes', 'inaccurate', 'inaccuracy_reason', 'due_day', 'close_day', 'settle_status', 'settle_amount', 'settle_notes'];
+const ITEM_INSERT = `INSERT INTO items (${ITEM_COLS.join(',')}) VALUES (${ITEM_COLS.map((_, i) => '$' + (i + 1)).join(',')})`;
+const ITEM_UPDATE = `UPDATE items SET ${ITEM_COLS.map((c, i) => c + '=$' + (i + 1)).join(',')} WHERE id=$${ITEM_COLS.length + 1}`;
+const SETTLE = ['', 'negotiating', 'pay-for-delete requested', 'settlement agreed (in writing)', 'settled - paid', 'paid in full'];
+const dayNum = v => { const n = parseInt(v); return n >= 1 && n <= 31 ? n : null; };
 function readItem(b) {
-  const fields = ['creditor', 'status', 'notes', 'inaccuracy_reason', 'acct'];
+  const fields = ['creditor', 'status', 'notes', 'inaccuracy_reason', 'acct', 'settle_notes'];
   if (fields.some(f => hasSSN(b[f]))) return { error: 'SSN-like number detected. Social Security numbers are never accepted — remove it and try again.' };
   const bureau = BUREAUS.find(x => x.toLowerCase() === String(b.bureau || '').trim().toLowerCase());
   const creditor = clean(b.creditor, 120);
   if (!bureau || !creditor) return { error: 'Bureau and creditor are required.' };
   return { v: [bureau, creditor, last4(b.acct), clean(b.type, 40), clean(b.status, 80), dt(b.date_opened), dt(b.dofd),
-    num(b.balance), num(b.credit_limit), clean(b.notes, 2000), b.inaccurate === 'on' || /^(y|yes|true|1)$/i.test(b.inaccurate || ''), clean(b.inaccuracy_reason, 300)] };
+    num(b.balance), num(b.credit_limit), clean(b.notes, 2000), b.inaccurate === 'on' || /^(y|yes|true|1)$/i.test(b.inaccurate || ''), clean(b.inaccuracy_reason, 300),
+    dayNum(b.due_day), dayNum(b.close_day), SETTLE.includes(b.settle_status) && b.settle_status ? b.settle_status : null, num(b.settle_amount), clean(b.settle_notes, 500)] };
 }
 app.get('/items/new', (req, res) => res.send(page(req, 'Add item', `<h1 class="neon">Add Item</h1>${itemForm(req, {}, '/items')}`)));
 app.post('/items', async (req, res) => {
   const r = readItem(req.body); if (r.error) { flash(req, r.error); return res.redirect('/items/new'); }
-  await q(`INSERT INTO items (bureau,creditor,acct_last4,type,status,date_opened,dofd,balance,credit_limit,notes,inaccurate,inaccuracy_reason) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, r.v);
+  await q(ITEM_INSERT, r.v);
   flash(req, 'Item saved.'); res.redirect('/items');
 });
 app.get('/items/:id/edit', async (req, res) => {
@@ -264,7 +353,7 @@ app.get('/items/:id/edit', async (req, res) => {
 app.post('/items/:id', async (req, res) => {
   const id = parseInt(req.params.id) || 0;
   const r = readItem(req.body); if (r.error) { flash(req, r.error); return res.redirect(`/items/${id}/edit`); }
-  await q(`UPDATE items SET bureau=$1,creditor=$2,acct_last4=$3,type=$4,status=$5,date_opened=$6,dofd=$7,balance=$8,credit_limit=$9,notes=$10,inaccurate=$11,inaccuracy_reason=$12 WHERE id=$13`, [...r.v, id]);
+  await q(ITEM_UPDATE, [...r.v, id]);
   flash(req, 'Item updated.'); res.redirect('/items');
 });
 app.post('/items/:id/delete', async (req, res) => { await q('DELETE FROM items WHERE id=$1', [parseInt(req.params.id) || 0]); flash(req, 'Item deleted.'); res.redirect('/items'); });
@@ -288,11 +377,12 @@ app.post('/upload', upload.single('file'), checkCsrf, async (req, res) => {
     for (const k of Object.keys(r)) if (hasSSN(r[k]) && !/account|acct/.test(k)) { r[k] = stripSSN(r[k]); stripped++; }
     const b = { bureau: r.bureau, creditor: r.creditor || r.furnisher, acct: r.account || r.account_number || r.acct || r.acct_last4,
       type: r.type, status: r.status, date_opened: r.date_opened || r.opened, dofd: r.dofd || r.date_of_first_delinquency,
-      balance: r.balance, credit_limit: r.limit || r.credit_limit, notes: r.notes, inaccurate: r.inaccurate, inaccuracy_reason: r.inaccuracy_reason };
+      balance: r.balance, credit_limit: r.limit || r.credit_limit, notes: r.notes, inaccurate: r.inaccurate, inaccuracy_reason: r.inaccuracy_reason,
+      due_day: r.due_day || r.payment_due_day, close_day: r.close_day || r.statement_close_day };
     b.acct = last4(b.acct) || '';
     const x = readItem(b);
     if (x.error) { bad++; continue; }
-    await q(`INSERT INTO items (bureau,creditor,acct_last4,type,status,date_opened,dofd,balance,credit_limit,notes,inaccurate,inaccuracy_reason) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, x.v);
+    await q(ITEM_INSERT, x.v);
     ok++;
   }
   flash(req, `Imported ${ok} item(s). Skipped ${bad}.${stripped ? ` Stripped ${stripped} SSN-like value(s).` : ''}`);
@@ -353,6 +443,63 @@ ${p.full_name || '[Signature]'}
 
 Enclosures: [list documents]` };
   }
+  if (kind === 'mov') {
+    const b = opts.bureau || it.bureau;
+    return { to: b, subject: `Method of verification request — ${it.creditor}`, text:
+`${me}
+
+${today}
+
+${BUREAU_ADDR[b]}
+
+RE: Request for description of reinvestigation procedure — FCRA Section 611(a)(6)(B)(iii) and 611(a)(7) (15 U.S.C. § 1681i(a)(7))
+
+To Whom It May Concern:
+
+On ${opts.orig ? fmtD(opts.orig) : '[date of original dispute]'} I disputed the following item in my ${b} credit file. You reported that the information was verified.
+
+  Creditor/Furnisher: ${it.creditor}
+  Account: ${acct}
+
+Under Section 611(a)(7) of the FCRA, I request a description of the procedure used to determine the accuracy and completeness of this information, including the business name, address, and telephone number of any furnisher you contacted. The law requires you to provide this description within 15 days of receiving this request.
+
+${reason}
+
+I continue to believe this information is inaccurate or incomplete. Please also add a statement of dispute to my file if the item remains.
+
+Sincerely,
+
+${p.full_name || '[Signature]'}` };
+  }
+  if (kind === 'pfd') return { to: it.creditor, subject: `Settlement offer — ${it.creditor}`, text:
+`${me}
+
+${today}
+
+${it.creditor}
+[Creditor or collector's mailing address]
+
+RE: Offer to resolve account ${acct}${it.balance != null ? ` (reported balance ${money(it.balance)})` : ''}
+
+To Whom It May Concern:
+
+I am writing to propose a resolution of the account referenced above. This letter is not an acknowledgment that I owe this debt and does not restart or extend any limitations period.
+
+I am prepared to pay ${opts.amount != null ? money(opts.amount) : '$[amount]'} as full and final settlement of this account, on the following conditions, agreed in writing before any payment:
+
+  1. You accept this amount as payment in full and will not sell or transfer any remaining balance;
+  2. You will request that the credit bureaus to which you report delete this account from my credit files (or, if you will not, that you report it as "paid in full" / "settled" with a zero balance);
+  3. You will provide the signed agreement on your letterhead before I pay.
+
+I understand you are not required to accept this offer or to request deletion, and that accurately reported information may lawfully remain on my credit report. Payment will be made only after I receive your written agreement.
+
+${opts.reason || ''}
+
+Please respond in writing to the address above.
+
+Sincerely,
+
+${p.full_name || '[Signature]'}` };
   if (kind === 'goodwill') return { to: it.creditor, subject: `Goodwill adjustment request — ${it.creditor}`, text:
 `${me}
 
@@ -412,8 +559,10 @@ app.get('/letters', async (req, res) => {
   res.send(page(req, 'Letters', `<h1 class="neon">Letter Generator</h1>
   <form method="get" action="/letters/view" class="card form-grid">
    <label>Item<select name="item" required>${opts}</select></label>
-   <label>Letter type<select name="kind" id="kind"><option value="dispute">Bureau dispute (FCRA §611)</option><option value="goodwill">Goodwill (creditor)</option><option value="validation">Debt validation (FDCPA §809)</option></select></label>
+   <label>Letter type<select name="kind" id="kind"><option value="dispute">Bureau dispute (FCRA §611)</option><option value="goodwill">Goodwill (creditor)</option><option value="validation">Debt validation (FDCPA §809)</option><option value="mov">Method of verification (FCRA §611(a)(7))</option><option value="pfd">Pay-for-delete / settlement offer</option></select></label>
    <label>Bureau (disputes)<select name="bureau"><option value="">Item's bureau</option>${BUREAUS.map(b => `<option>${b}</option>`).join('')}</select></label>
+   <label>Offer amount (pay-for-delete)<input name="amount" inputmode="decimal" placeholder="e.g. 250"></label>
+   <label>Original dispute date (MOV)<input type="date" name="orig"></label>
    <label class="full">Explanation (optional)<textarea name="reason" maxlength="1500" placeholder="What is inaccurate, or your goodwill circumstances"></textarea></label>
    <button class="full">Generate</button></form>
   ${items.length ? '' : '<p class="muted">Add an item first.</p>'}
@@ -424,72 +573,146 @@ app.get('/letters/view', async (req, res) => {
   const it = (await q('SELECT * FROM items WHERE id=$1', [parseInt(req.query.item) || 0])).rows[0];
   if (!it) return res.redirect('/letters');
   const p = (await q('SELECT * FROM profile WHERE id=1')).rows[0] || {};
-  const kind = ['dispute', 'goodwill', 'validation'].includes(req.query.kind) ? req.query.kind : 'dispute';
+  const kind = ['dispute', 'goodwill', 'validation', 'mov', 'pfd'].includes(req.query.kind) ? req.query.kind : 'dispute';
   const bureau = BUREAUS.includes(req.query.bureau) ? req.query.bureau : null;
   const reason = clean(req.query.reason, 1500);
-  const L = buildLetter(kind, it, p, { bureau, reason });
+  const L = buildLetter(kind, it, p, { bureau, reason, amount: num(req.query.amount), orig: dt(req.query.orig) });
   if (req.query.download) {
     res.set('Content-Type', 'text/plain; charset=utf-8');
     res.set('Content-Disposition', `attachment; filename="${kind}-${String(it.creditor).replace(/[^a-z0-9]+/gi, '_')}.txt"`);
     return res.send(L.text);
   }
-  const qs = new URLSearchParams({ item: it.id, kind, bureau: bureau || '', reason: reason || '', download: 1 }).toString();
+  const qs = new URLSearchParams({ item: it.id, kind, bureau: bureau || '', reason: reason || '', amount: req.query.amount || '', orig: req.query.orig || '', download: 1 }).toString();
   res.send(page(req, L.subject, `<div class="noprint"><h1 class="neon">${esc(L.subject)}</h1>
    <p><button class="print-btn">Print / Save PDF</button> <a class="btn" href="/letters/view?${esc(qs)}">Download .txt</a>
-   <a class="btn ghost" href="/deadlines?item=${it.id}&kind=${kind}&to=${encodeURIComponent(L.to)}">Log as sent →</a></p></div>
+   <a class="btn ghost" href="/deadlines?item=${it.id}&kind=${['mov', 'pfd'].includes(kind) ? (kind === 'mov' ? 'dispute' : 'validation') : kind}&to=${encodeURIComponent(L.to)}">Log as sent →</a></p></div>
    <article class="letter">${esc(L.text)}</article>`));
 });
 
 // Deadlines
 app.get('/deadlines', async (req, res) => {
-  const ds = (await q('SELECT d.*, i.creditor, i.bureau FROM disputes d LEFT JOIN items i ON i.id=d.item_id ORDER BY d.status, d.date_sent')).rows;
+  const ds = (await q("SELECT d.*, i.creditor, i.bureau FROM disputes d LEFT JOIN items i ON i.id=d.item_id ORDER BY (d.status='open') DESC, d.date_sent")).rows;
   const items = (await q('SELECT id, creditor, bureau, acct_last4 FROM items ORDER BY creditor')).rows;
-  const today = new Date(new Date().toISOString().slice(0, 10));
   const rows = ds.map(d => {
-    if (d.kind === 'goodwill') return `<tr class="${d.status !== 'open' ? 'done' : ''}"><td>${esc(d.kind)}</td><td>${esc(d.recipient)}</td><td>${esc(d.creditor || '—')}</td><td>${fmtD(d.date_sent)}</td>
-     <td class="muted">No legal deadline</td><td>${d.status !== 'open' ? esc(d.status) : '<span class="flag ok">awaiting reply</span>'}</td>
-     <td class="actions"><form method="post" action="/deadlines/${d.id}" class="inline">${csrf(req)}<select name="status">${['open', 'resolved - corrected', 'resolved - deleted', 'resolved - verified', 'no response'].map(s => `<option ${s === d.status ? 'selected' : ''}>${s}</option>`).join('')}</select><button class="sm">Update</button></form>
-     <form method="post" action="/deadlines/${d.id}/delete" class="inline confirm">${csrf(req)}<button class="ghost sm">✕</button></form></td></tr>`;
-    const due = addDays(d.date_sent, d.after_free_report ? 45 : 30);
-    const left = Math.ceil((due - today) / 86400000);
-    const cls = d.status !== 'open' ? 'done' : left < 0 ? 'overdue' : left <= 5 ? 'soon' : '';
-    return `<tr class="${cls}"><td>${esc(d.kind)}</td><td>${esc(d.recipient)}</td><td>${esc(d.creditor || '—')}</td><td>${fmtD(d.date_sent)}</td>
-     <td><b>${fmtD(due)}</b> <span class="muted">(${d.after_free_report ? 45 : 30}d)</span></td>
-     <td>${d.status !== 'open' ? esc(d.status) : left < 0 ? `<span class="flag err">OVERDUE ${-left}d</span>` : `<span class="flag ${left <= 5 ? 'warn' : 'ok'}">${left}d left</span>`}</td>
-     <td class="actions"><form method="post" action="/deadlines/${d.id}" class="inline">${csrf(req)}<select name="status">${['open', 'resolved - corrected', 'resolved - deleted', 'resolved - verified', 'no response'].map(s => `<option ${s === d.status ? 'selected' : ''}>${s}</option>`).join('')}</select><button class="sm">Update</button></form>
+    const x = timing(d), open = d.status === 'open';
+    let due = '<span class="muted">No legal deadline</span>', st;
+    if (d.kind === 'dispute') {
+      due = `<b>${fmtD(x.due)}</b> <span class="muted">(${x.days}d from ${d.mail_days ? 'receipt ' + fmtD(x.recv) : 'sent'})</span>`;
+      st = !open ? esc(d.status) : x.left < 0 ? `<span class="flag err">OVERDUE ${-x.left}d</span>` : `<span class="flag ${x.left <= 5 ? 'warn' : 'ok'}">${x.left}d left</span>`;
+    } else if (d.kind === 'validation') {
+      due = d.first_notice ? `<span class="muted">1st notice ${fmtD(d.first_notice)} → 30-day window ends</span> <b>${fmtD(x.windowEnd)}</b> ${x.inWindow ? '<span class="flag ok">sent in window</span>' : '<span class="flag err">sent after window</span>'}` : '<span class="muted">Log first-notice date to check the 30-day window</span>';
+      st = open ? '<span class="flag ok">awaiting verification</span>' : esc(d.status);
+    } else st = open ? '<span class="flag ok">awaiting reply</span>' : esc(d.status);
+    let follow = '';
+    if (d.kind === 'dispute' && d.item_id && (d.status === 'verified' || d.status === 'no response' || (open && x.left < 0))) {
+      const bq = BUREAUS.includes(d.recipient) ? '&bureau=' + d.recipient : '';
+      follow = `<div class="follow">${d.status === 'verified' ? `<a href="/letters/view?item=${d.item_id}&kind=mov${bq}&orig=${fmtD(d.date_sent)}">MOV letter</a>` : ''}
+        ${d.mov_sent ? `<span class="muted">MOV sent ${fmtD(d.mov_sent)} (reply due ${fmtD(addDays(new Date(d.mov_sent), 15))})</span>` : d.status === 'verified' ? `<form method="post" action="/deadlines/${d.id}/mov" class="inline">${csrf(req)}<button class="ghost sm">Mark MOV sent today</button></form>` : ''}
+        <a href="https://www.consumerfinance.gov/complaint/" target="_blank" rel="noopener noreferrer">File CFPB complaint ↗</a></div>`;
+    }
+    return `<tr class="${!open ? 'done' : x.left < 0 ? 'overdue' : x.left <= 5 ? 'soon' : ''}"><td>${esc(d.kind)}</td><td>${esc(d.recipient)}</td><td>${esc(d.creditor || '—')}</td><td>${fmtD(d.date_sent)}</td>
+     <td>${due}</td><td>${st}${d.outcome_date && !open ? ` <span class="muted">${fmtD(d.outcome_date)}</span>` : ''}${follow}</td>
+     <td class="actions"><form method="post" action="/deadlines/${d.id}" class="inline">${csrf(req)}<select name="status">${OUTCOMES.map(s => `<option ${s === d.status ? 'selected' : ''}>${s}</option>`).join('')}</select><button class="sm">Save outcome</button></form>
      <form method="post" action="/deadlines/${d.id}/delete" class="inline confirm">${csrf(req)}<button class="ghost sm">✕</button></form></td></tr>`;
   }).join('');
   const sel = parseInt(req.query.item) || 0;
-  res.send(page(req, 'Deadlines', `<h1 class="neon">30-Day Deadline Tracker</h1>
+  res.send(page(req, 'Deadlines', `<h1 class="neon">Deadline &amp; Outcome Tracker</h1>
    <form method="post" action="/deadlines" class="card form-grid">${csrf(req)}
     <label>Item<select name="item_id"><option value="">(none)</option>${items.map(i => `<option value="${i.id}" ${i.id === sel ? 'selected' : ''}>${esc(i.creditor)} (${esc(i.bureau)})</option>`).join('')}</select></label>
     <label>Type<select name="kind">${['dispute', 'goodwill', 'validation'].map(k => `<option ${k === req.query.kind ? 'selected' : ''}>${k}</option>`).join('')}</select></label>
     <label>Sent to<input name="recipient" required maxlength="120" value="${esc(req.query.to || '')}"></label>
     <label>Date sent<input type="date" name="date_sent" required value="${new Date().toISOString().slice(0, 10)}"></label>
+    <label>Mail days until received (disputes; 0 = count from sent)<input type="number" name="mail_days" min="0" max="30" value="0"></label>
+    <label>Collector's first notice date (validation)<input type="date" name="first_notice"></label>
     <label class="check full"><input type="checkbox" name="after_free_report"> This dispute followed my free annual credit report (45-day window)</label>
     <button class="full">Log letter</button></form>
-   <div class="card scroll"><table><thead><tr><th>Type</th><th>To</th><th>Item</th><th>Sent</th><th>Due</th><th>Status</th><th></th></tr></thead>
+   <div class="card scroll"><table><thead><tr><th>Type</th><th>To</th><th>Item</th><th>Sent</th><th>Deadline / window</th><th>Status / outcome</th><th></th></tr></thead>
    <tbody>${rows || '<tr><td colspan="7" class="muted">Nothing logged yet.</td></tr>'}</tbody></table></div>
-   <p class="muted">FCRA §611 generally gives bureaus 30 days from receipt (45 if the dispute follows a free annual report). Due dates here count from the date sent; add mailing time. Goodwill letters carry no legal deadline.</p>`));
+   <p class="muted">FCRA §611 gives bureaus 30 days from <i>receipt</i> (45 if the dispute follows a free annual report) — enter mail days (certified mail is typically 3–5) to count from receipt. If an item comes back "verified", you can request the method of verification (§611(a)(7); reply due within 15 days) and/or file a complaint with the CFPB. A validation request under FDCPA §809(b) is strongest within 30 days of the collector's first notice. Goodwill letters carry no legal deadline.</p>`));
 });
 app.post('/deadlines', async (req, res) => {
   const b = req.body; const d = dt(b.date_sent);
   if (!d || !clean(b.recipient)) { flash(req, 'Recipient and date are required.'); return res.redirect('/deadlines'); }
-  await q('INSERT INTO disputes (item_id, kind, recipient, date_sent, after_free_report) VALUES ($1,$2,$3,$4,$5)',
-    [parseInt(b.item_id) || null, ['dispute', 'goodwill', 'validation'].includes(b.kind) ? b.kind : 'dispute', clean(b.recipient, 120), d, b.after_free_report === 'on' && (b.kind || 'dispute') === 'dispute']);
+  const kind = ['dispute', 'goodwill', 'validation'].includes(b.kind) ? b.kind : 'dispute';
+  const md = Math.min(30, Math.max(0, parseInt(b.mail_days) || 0));
+  await q('INSERT INTO disputes (item_id, kind, recipient, date_sent, after_free_report, mail_days, first_notice) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+    [parseInt(b.item_id) || null, kind, clean(b.recipient, 120), d, b.after_free_report === 'on' && kind === 'dispute', kind === 'dispute' ? md : 0, kind === 'validation' ? dt(b.first_notice) : null]);
   flash(req, 'Logged.'); res.redirect('/deadlines');
 });
+app.post('/deadlines/:id/mov', async (req, res) => {
+  await q('UPDATE disputes SET mov_sent=$1 WHERE id=$2', [new Date().toISOString().slice(0, 10), parseInt(req.params.id) || 0]);
+  flash(req, 'Method-of-verification request logged — reply due in 15 days.'); res.redirect('/deadlines');
+});
 app.post('/deadlines/:id', async (req, res) => {
-  const s = ['open', 'resolved - corrected', 'resolved - deleted', 'resolved - verified', 'no response'].includes(req.body.status) ? req.body.status : 'open';
-  await q('UPDATE disputes SET status=$1 WHERE id=$2', [s, parseInt(req.params.id) || 0]); res.redirect('/deadlines');
+  const s = OUTCOMES.includes(req.body.status) ? req.body.status : 'open';
+  await q('UPDATE disputes SET status=$1, outcome_date=$2 WHERE id=$3', [s, s === 'open' ? null : new Date().toISOString().slice(0, 10), parseInt(req.params.id) || 0]);
+  flash(req, 'Outcome saved.'); res.redirect('/deadlines');
 });
 app.post('/deadlines/:id/delete', async (req, res) => { await q('DELETE FROM disputes WHERE id=$1', [parseInt(req.params.id) || 0]); res.redirect('/deadlines'); });
+
+// Scores
+const SCORE_COL = { Equifax: '#ff2bd6', Experian: '#00f0ff', TransUnion: '#3dffa8' };
+function scoreChart(rows) {
+  if (!rows.length) return '<p class="muted">Log a score to start the chart.</p>';
+  const W = 760, H = 300, P = 44;
+  const ts = rows.map(r => new Date(r.score_date).getTime());
+  let t0 = Math.min(...ts), t1 = Math.max(...ts); if (t0 === t1) { t0 -= 15 * 864e5; t1 += 15 * 864e5; }
+  const sc = rows.map(r => r.score);
+  const y0 = Math.max(300, Math.floor((Math.min(...sc) - 30) / 50) * 50), y1 = Math.min(850, Math.ceil((Math.max(...sc) + 30) / 50) * 50);
+  const X = t => P + (t - t0) / (t1 - t0) * (W - P * 2), Y = v => H - P + 10 - (v - y0) / (y1 - y0) * (H - P * 1.5);
+  let g = '';
+  for (let v = y0; v <= y1; v += 50) g += `<line x1="${P}" x2="${W - P}" y1="${Y(v)}" y2="${Y(v)}" stroke="#1d2550"/><text x="${P - 8}" y="${Y(v) + 4}" text-anchor="end" fill="#7d86b8" font-size="11">${v}</text>`;
+  for (const v of [580, 670, 740]) if (v > y0 && v < y1) g += `<line x1="${P}" x2="${W - P}" y1="${Y(v)}" y2="${Y(v)}" stroke="#ffcc00" stroke-dasharray="4 4" opacity=".35"/>`;
+  g += `<text x="${P}" y="${H - 6}" fill="#7d86b8" font-size="11">${fmtD(t0)}</text><text x="${W - P}" y="${H - 6}" text-anchor="end" fill="#7d86b8" font-size="11">${fmtD(t1)}</text>`;
+  for (const b of BUREAUS) {
+    const pts = rows.filter(r => r.bureau === b).sort((a, c) => new Date(a.score_date) - new Date(c.score_date));
+    if (!pts.length) continue;
+    const pl = pts.map(r => `${X(new Date(r.score_date).getTime()).toFixed(1)},${Y(r.score).toFixed(1)}`).join(' ');
+    g += `<polyline points="${pl}" fill="none" stroke="${SCORE_COL[b]}" stroke-width="3" filter="url(#glow)"/>`;
+    g += pts.map(r => `<circle cx="${X(new Date(r.score_date).getTime()).toFixed(1)}" cy="${Y(r.score).toFixed(1)}" r="4" fill="${SCORE_COL[b]}"><title>${b} ${r.score} on ${fmtD(r.score_date)}</title></circle>`).join('');
+  }
+  const legend = BUREAUS.map(b => `<span style="color:${SCORE_COL[b]}">● ${b}</span>`).join(' &nbsp; ');
+  return `<svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="Credit score history"><defs><filter id="glow"><feGaussianBlur stdDeviation="2.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>${g}</svg><p>${legend} <span class="muted">· dashed lines: 580 / 670 / 740 (fair / good / very good, FICO)</span></p>`;
+}
+app.get('/scores', async (req, res) => {
+  const rows = (await q('SELECT * FROM scores ORDER BY score_date, id')).rows;
+  const first = {}, last = {};
+  for (const r of rows) { first[r.bureau] ??= r; last[r.bureau] = r; }
+  const summary = BUREAUS.filter(b => last[b]).map(b => { const ch = last[b].score - first[b].score; return `<div class="stat"><b>${last[b].score}</b><span>${b} · ${ch >= 0 ? '+' : ''}${ch} since ${fmtD(first[b].score_date)}</span></div>`; }).join('');
+  res.send(page(req, 'Scores', `<h1 class="neon">Score Tracker</h1>
+   ${summary ? `<div class="stats">${summary}</div>` : ''}
+   <div class="card glow">${scoreChart(rows)}</div>
+   <form method="post" action="/scores" class="card form-grid">${csrf(req)}
+    <label>Bureau<select name="bureau">${BUREAUS.map(b => `<option>${b}</option>`).join('')}</select></label>
+    <label>Score (300–850)<input type="number" name="score" min="300" max="850" required></label>
+    <label>Date<input type="date" name="score_date" required value="${new Date().toISOString().slice(0, 10)}"></label>
+    <label>Model / source<input name="model" maxlength="60" placeholder="FICO 8, VantageScore 3.0..."></label>
+    <button class="full">Log score</button></form>
+   <div class="card scroll"><table><thead><tr><th>Date</th><th>Bureau</th><th>Score</th><th>Model</th><th></th></tr></thead><tbody>
+   ${rows.slice().reverse().map(r => `<tr><td>${fmtD(r.score_date)}</td><td>${esc(r.bureau)}</td><td><b>${r.score}</b></td><td>${esc(r.model || '')}</td><td><form method="post" action="/scores/${r.id}/delete" class="inline confirm">${csrf(req)}<button class="ghost sm">✕</button></form></td></tr>`).join('') || '<tr><td colspan="5" class="muted">No scores yet.</td></tr>'}
+   </tbody></table></div><p class="muted">Different models (FICO vs VantageScore) and sources give different numbers — compare like with like.</p>`));
+});
+app.post('/scores', async (req, res) => {
+  const b = req.body, sc = parseInt(b.score), d = dt(b.score_date), bureau = BUREAUS.find(x => x === b.bureau);
+  if (!bureau || !d || !(sc >= 300 && sc <= 850)) { flash(req, 'Bureau, date and a score between 300 and 850 are required.'); return res.redirect('/scores'); }
+  await q('INSERT INTO scores (bureau, score, model, score_date) VALUES ($1,$2,$3,$4)', [bureau, sc, clean(b.model, 60), d]);
+  flash(req, 'Score logged.'); res.redirect('/scores');
+});
+app.post('/scores/:id/delete', async (req, res) => { await q('DELETE FROM scores WHERE id=$1', [parseInt(req.params.id) || 0]); res.redirect('/scores'); });
 
 // Tips + utilization
 app.get('/tips', async (req, res) => {
   const cards = dedupeCards((await q("SELECT creditor, acct_last4, balance, credit_limit FROM items WHERE type='Credit Card' ORDER BY creditor")).rows);
+  const budget = num(req.query.budget) || 0, plan = payoffPlan(cards, budget);
+  const planHtml = plan.list.length ? `<div class="card glow"><h2>Payoff plan (highest utilization first)</h2>
+   <form method="get" action="/tips" class="inline">Extra cash available this month $<input name="budget" inputmode="decimal" value="${budget || ''}" class="sm-in"> <button class="sm">Plan</button></form>
+   <div class="scroll"><table><thead><tr><th>#</th><th>Card</th><th>Balance</th><th>Limit</th><th>Util</th><th>To 30%</th><th>To 10%</th>${budget ? '<th>Pay now</th>' : ''}</tr></thead><tbody>
+   ${plan.list.map((c, i) => `<tr><td>${i + 1}</td><td>${esc(c.name)}</td><td>${money(c.b)}</td><td>${money(c.l)}</td><td class="${c.u < 10 ? 'good' : c.u < 30 ? 'mid' : 'high'}">${c.u.toFixed(1)}%</td><td>${money(c.to30)}</td><td>${money(c.to10)}</td>${budget ? `<td><b>${money(c.pay)}</b></td>` : ''}</tr>`).join('')}
+   </tbody></table></div>
+   <p>Overall ${plan.util.toFixed(1)}%${budget ? ` → <b>${plan.after.toFixed(1)}%</b> after paying ${money(plan.P)}${plan.leftover > 0 ? ` (${money(plan.leftover)} left over — all cards under 10%)` : ''}` : ''}. Order: the card with the highest utilization % gets money first until every card is under 30%, then under 10%. Pay before each statement closing date so the lower balance is what gets reported. (If you're paying down to save interest instead, target the highest APR first.)</p></div>` : '';
   const seed = JSON.stringify(cards.map(c => ({ n: c.creditor + (c.acct_last4 ? ' ••' + c.acct_last4 : ''), b: Number(c.balance || 0), l: Number(c.credit_limit || 0) })));
   res.send(page(req, 'Tips', `<h1 class="neon">Score Tips &amp; Utilization</h1>
+  ${planHtml}
   <div class="card glow"><h2>Utilization calculator</h2>
    <div id="util" data-seed="${esc(seed)}"></div>
    <p><button type="button" id="addcard" class="ghost">+ Add card</button></p>
