@@ -20,14 +20,11 @@ const USE_PG = !!process.env.DATABASE_URL;
 const ADMIN_HASH = bcrypt.hashSync(process.env.ADMIN_PASSWORD, 12);
 
 // Postgres when DATABASE_URL is set; otherwise an in-process, NON-persistent PGlite fallback.
-let pool = null, lite = null;
-if (USE_PG) pool = new Pool({ connectionString: process.env.DATABASE_URL,
+let pool;
+if (!USE_PG) { const { newDb } = require('pg-mem'); const { Pool: MemPool } = newDb().adapters.createPg(); pool = new MemPool(); }
+else pool = new Pool({ connectionString: process.env.DATABASE_URL,
   ssl: /render\.com/.test(process.env.DATABASE_URL) ? { rejectUnauthorized: false } : false });
-const q = async (t, p) => {
-  if (pool) return pool.query(t, p);
-  if (!lite) { const { PGlite } = await import('@electric-sql/pglite'); lite = new PGlite(); }
-  return lite.query(t, p || []);
-};
+const q = (t, p) => pool.query(t, p);
 
 async function migrate() {
   await q(`CREATE TABLE IF NOT EXISTS items (
