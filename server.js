@@ -51,6 +51,17 @@ const dt = s => { if (!s) return null; const d = new Date(s); return isNaN(d) ? 
 const fmtD = d => d ? new Date(d).toISOString().slice(0, 10) : '—';
 const money = v => v == null ? '—' : '$' + Number(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const addDays = (d, n) => { const x = new Date(d); x.setUTCDate(x.getUTCDate() + n); return x; };
+// Same account reported by several bureaus counts once (highest reported balance/limit).
+function dedupeCards(cards) {
+  const m = new Map();
+  for (const c of cards) {
+    const k = (c.creditor || '').toLowerCase().replace(/[^a-z0-9]/g, '') + '|' + (c.acct_last4 || '');
+    const o = m.get(k);
+    if (!o) m.set(k, { ...c });
+    else { o.balance = Math.max(Number(o.balance || 0), Number(c.balance || 0)); o.credit_limit = Math.max(Number(o.credit_limit || 0), Number(c.credit_limit || 0)); }
+  }
+  return [...m.values()];
+}
 const BUREAUS = ['Equifax', 'Experian', 'TransUnion'];
 const BUREAU_ADDR = {
   Equifax: 'Equifax Information Services LLC\nP.O. Box 740256\nAtlanta, GA 30374-0256',
@@ -86,6 +97,7 @@ function analyze(items) {
       if (o.credit_limit != null && it.credit_limit != null && Number(o.credit_limit) !== Number(it.credit_limit)) mm.add('limit');
     }
     if (mm.size) f.push({ c: 'err', t: 'Cross-bureau mismatch: ' + [...mm].join(', ') });
+    if (it.dofd && new Date(it.dofd) > today) f.push({ c: 'err', t: 'Date of first delinquency is in the future — check entry' });
     if (it.dofd) {
       const yrs = /bankruptcy ch\.?\s*7/i.test(it.type || '') ? 10 : 7;
       const limit = addDays(new Date(it.dofd), Math.round(yrs * 365.25));
@@ -153,7 +165,7 @@ app.get('/login', (req, res) => res.send(page(req, 'Login', `<div class="login c
 app.post('/login', loginLimiter, async (req, res) => {
   const { username = '', password = '' } = req.body;
   const ok = (await bcrypt.compare(String(password), ADMIN_HASH)) && String(username).trim().toLowerCase() === ADMIN_USER.toLowerCase();
-  if (!ok) { flash(req, 'Invalid credentials'); return res.status(401).redirect('/login'); }
+  if (!ok) { return res.status(401).send(page(req, 'Login', '<div class="login card"><h1>Invalid credentials</h1><p><a href="/login">Try again</a></p></div>')); }
   const csrfTok = crypto.randomBytes(24).toString('hex');
   req.session.regenerate(err => {
     if (err) return res.status(500).send('Session error');
@@ -168,12 +180,12 @@ app.use(auth);
 // Dashboard
 app.get('/', async (req, res) => {
   const items = analyze((await q('SELECT * FROM items ORDER BY creditor')).rows);
-  const ds = (await q("SELECT * FROM disputes WHERE status='open'")).rows;
+  const ds = (await q("SELECT * FROM disputes WHERE status='open' AND kind <> 'goodwill'")).rows;
   const today = new Date();
   const overdue = ds.filter(d => addDays(d.date_sent, d.after_free_report ? 45 : 30) < today).length;
   const flagged = items.filter(i => i.flags.some(f => f.c === 'err')).length;
   const old = items.filter(i => i.flags.some(f => f.c === 'old')).length;
-  const cards = items.filter(i => /credit card/i.test(i.type || '') && Number(i.credit_limit) > 0);
+  const cards = dedupeCards(items.filter(i => /credit card/i.test(i.type || '') && Number(i.credit_limit) > 0));
   const bal = cards.reduce((s, c) => s + Number(c.balance || 0), 0), lim = cards.reduce((s, c) => s + Number(c.credit_limit || 0), 0);
   const util = lim ? (bal / lim * 100) : null;
   res.send(page(req, 'Dashboard', `<h1 class="neon">Command Center</h1>
@@ -434,6 +446,10 @@ app.get('/deadlines', async (req, res) => {
   const items = (await q('SELECT id, creditor, bureau, acct_last4 FROM items ORDER BY creditor')).rows;
   const today = new Date(new Date().toISOString().slice(0, 10));
   const rows = ds.map(d => {
+    if (d.kind === 'goodwill') return `<tr class="${d.status !== 'open' ? 'done' : ''}"><td>${esc(d.kind)}</td><td>${esc(d.recipient)}</td><td>${esc(d.creditor || '—')}</td><td>${fmtD(d.date_sent)}</td>
+     <td class="muted">No legal deadline</td><td>${d.status !== 'open' ? esc(d.status) : '<span class="flag ok">awaiting reply</span>'}</td>
+     <td class="actions"><form method="post" action="/deadlines/${d.id}" class="inline">${csrf(req)}<select name="status">${['open', 'resolved - corrected', 'resolved - deleted', 'resolved - verified', 'no response'].map(s => `<option ${s === d.status ? 'selected' : ''}>${s}</option>`).join('')}</select><button class="sm">Update</button></form>
+     <form method="post" action="/deadlines/${d.id}/delete" class="inline confirm">${csrf(req)}<button class="ghost sm">✕</button></form></td></tr>`;
     const due = addDays(d.date_sent, d.after_free_report ? 45 : 30);
     const left = Math.ceil((due - today) / 86400000);
     const cls = d.status !== 'open' ? 'done' : left < 0 ? 'overdue' : left <= 5 ? 'soon' : '';
@@ -460,7 +476,7 @@ app.post('/deadlines', async (req, res) => {
   const b = req.body; const d = dt(b.date_sent);
   if (!d || !clean(b.recipient)) { flash(req, 'Recipient and date are required.'); return res.redirect('/deadlines'); }
   await q('INSERT INTO disputes (item_id, kind, recipient, date_sent, after_free_report) VALUES ($1,$2,$3,$4,$5)',
-    [parseInt(b.item_id) || null, ['dispute', 'goodwill', 'validation'].includes(b.kind) ? b.kind : 'dispute', clean(b.recipient, 120), d, b.after_free_report === 'on']);
+    [parseInt(b.item_id) || null, ['dispute', 'goodwill', 'validation'].includes(b.kind) ? b.kind : 'dispute', clean(b.recipient, 120), d, b.after_free_report === 'on' && (b.kind || 'dispute') === 'dispute']);
   flash(req, 'Logged.'); res.redirect('/deadlines');
 });
 app.post('/deadlines/:id', async (req, res) => {
@@ -471,7 +487,7 @@ app.post('/deadlines/:id/delete', async (req, res) => { await q('DELETE FROM dis
 
 // Tips + utilization
 app.get('/tips', async (req, res) => {
-  const cards = (await q("SELECT creditor, acct_last4, balance, credit_limit FROM items WHERE type='Credit Card' ORDER BY creditor")).rows;
+  const cards = dedupeCards((await q("SELECT creditor, acct_last4, balance, credit_limit FROM items WHERE type='Credit Card' ORDER BY creditor")).rows);
   const seed = JSON.stringify(cards.map(c => ({ n: c.creditor + (c.acct_last4 ? ' ••' + c.acct_last4 : ''), b: Number(c.balance || 0), l: Number(c.credit_limit || 0) })));
   res.send(page(req, 'Tips', `<h1 class="neon">Score Tips &amp; Utilization</h1>
   <div class="card glow"><h2>Utilization calculator</h2>
